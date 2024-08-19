@@ -12,30 +12,10 @@
 #include "esphome/core/component.h"
 #include "esphome/core/gpio.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/ring_buffer.h"
 
 namespace esphome {
 namespace i2s_audio {
-
-static const size_t BUFFER_SIZE = 1024;
-
-enum class TaskEventType : uint8_t {
-  STARTING = 0,
-  STARTED,
-  STOPPING,
-  STOPPED,
-  WARNING = 255,
-};
-
-struct TaskEvent {
-  TaskEventType type;
-  esp_err_t err;
-};
-
-struct DataEvent {
-  bool stop;
-  size_t len;
-  uint8_t data[BUFFER_SIZE];
-};
 
 class I2SAudioSpeaker : public I2SAudioOut, public speaker::Speaker, public Component {
  public:
@@ -66,8 +46,8 @@ class I2SAudioSpeaker : public I2SAudioOut, public speaker::Speaker, public Comp
   static void player_task(void *params);
 
   TaskHandle_t player_task_handle_{nullptr};
-  QueueHandle_t buffer_queue_;
   QueueHandle_t event_queue_;
+  std::unique_ptr<RingBuffer> buffer_;
 
   uint32_t timeout_{0};
   uint8_t dout_pin_{0};

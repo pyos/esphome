@@ -12,14 +12,28 @@ namespace esphome {
 namespace i2s_audio {
 
 static const size_t BUFFER_COUNT = 20;
+static const size_t BUFFER_SIZE = 1024;
+
+enum class TaskEventType : uint8_t {
+  STARTING = 0,
+  STARTED,
+  STOPPING,
+  STOPPED,
+  WARNING = 255,
+};
+
+struct TaskEvent {
+  TaskEventType type;
+  esp_err_t err;
+};
 
 static const char *const TAG = "i2s_audio.speaker";
 
 void I2SAudioSpeaker::setup() {
   ESP_LOGCONFIG(TAG, "Setting up I2S Audio Speaker...");
 
-  this->buffer_queue_ = xQueueCreate(BUFFER_COUNT, sizeof(DataEvent));
-  if (this->buffer_queue_ == nullptr) {
+  this->buffer_ = RingBuffer::create(BUFFER_COUNT * BUFFER_SIZE);
+  if (this->buffer_ == nullptr) {
     ESP_LOGE(TAG, "Failed to create buffer queue");
     this->mark_failed();
     return;
@@ -43,6 +57,7 @@ void I2SAudioSpeaker::start() {
     return;
   }
   this->state_ = speaker::STATE_STARTING;
+  this->buffer_.reset(); // always succeeds since there's no reader task
 }
 void I2SAudioSpeaker::start_() {
   if (this->task_created_) {
@@ -54,21 +69,6 @@ void I2SAudioSpeaker::start_() {
 
   xTaskCreate(I2SAudioSpeaker::player_task, "speaker_task", 8192, (void *) this, 1, &this->player_task_handle_);
   this->task_created_ = true;
-}
-
-template<typename a, typename b> const uint8_t *convert_data_format(const a *from, b *to, size_t &bytes, bool repeat) {
-  if (sizeof(a) == sizeof(b) && !repeat) {
-    return reinterpret_cast<const uint8_t *>(from);
-  }
-  const b *result = to;
-  for (size_t i = 0; i < bytes; i += sizeof(a)) {
-    b value = static_cast<b>(*from++) << (sizeof(b) - sizeof(a)) * 8;
-    *to++ = value;
-    if (repeat)
-      *to++ = value;
-  }
-  bytes *= (sizeof(b) / sizeof(a)) * (repeat ? 2 : 1);  // NOLINT
-  return reinterpret_cast<const uint8_t *>(result);
 }
 
 void I2SAudioSpeaker::player_task(void *params) {
@@ -85,8 +85,8 @@ void I2SAudioSpeaker::player_task(void *params) {
       .channel_format = this_speaker->channel_,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 8,
-      .dma_buf_len = 256,
+      .dma_buf_count = 4,
+      .dma_buf_len = 1024,
       .use_apll = this_speaker->use_apll_,
       .tx_desc_auto_clear = true,
       .fixed_mclk = 0,
@@ -124,39 +124,54 @@ void I2SAudioSpeaker::player_task(void *params) {
   }
 #endif
 
-  DataEvent data_event;
-
   event.type = TaskEventType::STARTED;
   xQueueSend(this_speaker->event_queue_, &event, portMAX_DELAY);
 
   int32_t buffer[BUFFER_SIZE];
+  uint8_t *buffer_start = reinterpret_cast<uint8_t *>(buffer);
+  size_t buffer_size = sizeof(buffer);
+  bool mono = this_speaker->channel_ == I2S_CHANNEL_FMT_ALL_LEFT;
+  bool to32 = this_speaker->bits_per_sample_ > I2S_BITS_PER_SAMPLE_16BIT;
+  for (int i = 0; i < mono + to32; i++) {
+    buffer_size /= 2;
+    buffer_start += buffer_size;
+  }
 
-  while (true) {
-    if (xQueueReceive(this_speaker->buffer_queue_, &data_event, this_speaker->timeout_ / portTICK_PERIOD_MS) !=
-        pdTRUE) {
-      break;  // End of audio from main thread
-    }
-    if (data_event.stop) {
-      // Stop signal from main thread
-      xQueueReset(this_speaker->buffer_queue_);  // Flush queue
-      break;
+  while (this_speaker->state_ != speaker::STATE_STOPPING) {
+    size_t remaining = this_speaker->buffer_->read(buffer_start, buffer_size, this_speaker->timeout_ / portTICK_PERIOD_MS);
+    if (remaining == 0 || remaining % 2 == 1) {
+      break;  // Either received nothing, or reached an immediate stop signal.
     }
 
-    const uint8_t *data = data_event.data;
-    size_t remaining = data_event.len;
-    switch (this_speaker->bits_per_sample_) {
-      case I2S_BITS_PER_SAMPLE_8BIT:
-      case I2S_BITS_PER_SAMPLE_16BIT: {
-        data = convert_data_format(reinterpret_cast<const int16_t *>(data), reinterpret_cast<int16_t *>(buffer),
-                                   remaining, this_speaker->channel_ == I2S_CHANNEL_FMT_ALL_LEFT);
-        break;
+    const uint8_t *data = buffer_start;
+    if (to32) {
+      const int16_t *in = reinterpret_cast<const int16_t *>(data);
+      int32_t *out = buffer;
+      if (mono) {
+        for (size_t i = 0; i < remaining; i += sizeof(int16_t)) {
+          int32_t sample = static_cast<int32_t>(*in++) << 16;
+          *out++ = sample;
+          *out++ = sample;
+        }
+        data = reinterpret_cast<const uint8_t *>(buffer);
+        remaining *= 4;
+      } else {
+        for (size_t i = 0; i < remaining; i += sizeof(int16_t)) {
+          *out++ = static_cast<int32_t>(*in++) << 16;
+        }
+        data = reinterpret_cast<const uint8_t *>(buffer);
+        remaining *= 2;
       }
-      case I2S_BITS_PER_SAMPLE_24BIT:
-      case I2S_BITS_PER_SAMPLE_32BIT: {
-        data = convert_data_format(reinterpret_cast<const int16_t *>(data), reinterpret_cast<int32_t *>(buffer),
-                                   remaining, this_speaker->channel_ == I2S_CHANNEL_FMT_ALL_LEFT);
-        break;
+    } else if (mono) {
+      const int16_t *in = reinterpret_cast<const int16_t *>(data);
+      int16_t *out = reinterpret_cast<int16_t *>(buffer);
+      for (size_t i = 0; i < remaining; i += sizeof(int16_t)) {
+        int16_t sample = *in++;
+        *out++ = sample;
+        *out++ = sample;
       }
+      data = reinterpret_cast<const uint8_t *>(buffer);
+      remaining *= 2;
     }
 
     while (remaining != 0) {
@@ -207,14 +222,16 @@ void I2SAudioSpeaker::stop_(bool wait_on_empty) {
     this->state_ = speaker::STATE_STOPPED;
     return;
   }
+  // The reader task does this:
+  //   check state -> check buffer size size -> maybe fall asleep -> handle data
+  //                  \--------- atomic w.r.t. write() ---------/
+  // If it is currently handling data, this will make the next state check stop:
   this->state_ = speaker::STATE_STOPPING;
-  DataEvent data;
-  data.stop = true;
-  if (wait_on_empty) {
-    xQueueSend(this->buffer_queue_, &data, portMAX_DELAY);
-  } else {
-    xQueueSendToFront(this->buffer_queue_, &data, portMAX_DELAY);
-  }
+  // If it has already checked the state but has not entered the atomic section
+  // yet, this will ensure it does not fall asleep:
+  this->buffer_->write_without_replacement("", 1);
+  // And if it has already fallen asleep, this will wake it up:
+  xTaskNotifyGive(this->player_task_handle_);
 }
 
 void I2SAudioSpeaker::watch_() {
@@ -238,7 +255,7 @@ void I2SAudioSpeaker::watch_() {
         this->task_created_ = false;
         this->player_task_handle_ = nullptr;
         this->parent_->unlock();
-        xQueueReset(this->buffer_queue_);
+        this->buffer_->reset();
         ESP_LOGD(TAG, "Stopped I2S Audio Speaker");
         break;
       case TaskEventType::WARNING:
@@ -268,27 +285,17 @@ size_t I2SAudioSpeaker::play(const uint8_t *data, size_t length) {
     ESP_LOGE(TAG, "Cannot play audio, speaker failed to setup");
     return 0;
   }
-  if (this->state_ != speaker::STATE_RUNNING && this->state_ != speaker::STATE_STARTING) {
+  if (this->state_ == speaker::STATE_STOPPING) {
+    return 0;
+  }
+  if (this->state_ == speaker::STATE_STOPPED) {
     this->start();
   }
-  size_t remaining = length;
-  size_t index = 0;
-  while (remaining > 0) {
-    DataEvent event;
-    event.stop = false;
-    size_t to_send_length = std::min(remaining, BUFFER_SIZE);
-    event.len = to_send_length;
-    memcpy(event.data, data + index, to_send_length);
-    if (xQueueSend(this->buffer_queue_, &event, 0) != pdTRUE) {
-      return index;
-    }
-    remaining -= to_send_length;
-    index += to_send_length;
-  }
-  return index;
+  // Samples should be 2- or 4-byte long; round down to a sample boundary.
+  return this->buffer_->write(data, length & ~static_cast<size_t>(1));
 }
 
-bool I2SAudioSpeaker::has_buffered_data() const { return uxQueueMessagesWaiting(this->buffer_queue_) > 0; }
+bool I2SAudioSpeaker::has_buffered_data() const { return this->buffer_->available() > 0; }
 
 }  // namespace i2s_audio
 }  // namespace esphome
